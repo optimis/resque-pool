@@ -14,7 +14,10 @@ describe Resque::Pool, "when loading a simple pool configuration" do
   let(:config) do
     { 'foo' => 1, 'bar' => 2, 'foo,bar' => 3, 'bar,foo' => 4, }
   end
-  subject { Resque::Pool.new(config) }
+
+  let(:pool) { Resque::Pool.instance }
+  before { pool.init_config(config) }
+  subject { pool }
 
   context "when ENV['RACK_ENV'] is set" do
     before { ENV['RACK_ENV'] = 'development' }
@@ -30,7 +33,6 @@ describe Resque::Pool, "when loading a simple pool configuration" do
 end
 
 describe Resque::Pool, "when loading the pool configuration from a Hash" do
-
   let(:config) do
     {
       'foo' => 8,
@@ -39,10 +41,14 @@ describe Resque::Pool, "when loading the pool configuration from a Hash" do
     }
   end
 
-  subject { Resque::Pool.new(config) }
-
+  let(:pool) { Resque::Pool.instance }
   context "when RAILS_ENV is set" do
-    before { RAILS_ENV = "test" }
+    before do
+      RAILS_ENV = "test"
+      pool.init_config(config)
+    end
+
+    subject { pool }
 
     it "should load the default values from the Hash" do
       subject.config["foo"].should == 8
@@ -64,7 +70,10 @@ describe Resque::Pool, "when loading the pool configuration from a Hash" do
     before(:each) do
       module Rails; end
       Rails.stub(:env).and_return('test')
+      pool.init_config(config)
     end
+
+    subject { pool }
 
     it "should load the default values from the Hash" do
       subject.config["foo"].should == 8
@@ -85,7 +94,13 @@ describe Resque::Pool, "when loading the pool configuration from a Hash" do
 
 
   context "when ENV['RESQUE_ENV'] is set" do
-    before { ENV['RESQUE_ENV'] = 'development' }
+    before do
+      ENV['RESQUE_ENV'] = 'development'
+      pool.init_config(config)
+    end
+
+    subject { pool }
+
     it "should load the config for that environment" do
       subject.config["foo"].should == 8
       subject.config["foo,bar"].should == 16
@@ -95,6 +110,9 @@ describe Resque::Pool, "when loading the pool configuration from a Hash" do
   end
 
   context "when there is no environment" do
+    before { pool.init_config(config) }
+    subject { pool }
+
     it "should load the default values only" do
       subject.config["foo"].should == 8
       subject.config["bar"].should be_nil
@@ -106,18 +124,25 @@ describe Resque::Pool, "when loading the pool configuration from a Hash" do
 end
 
 describe Resque::Pool, "given no configuration" do
-  subject { Resque::Pool.new(nil) }
+  let(:pool) { Resque::Pool.instance }
+  before { pool.init_config({}) }
+  subject { pool }
+
   it "should have no worker types" do
     subject.config.should == {}
   end
 end
 
 describe Resque::Pool, "when loading the pool configuration from a file" do
-
-  subject { Resque::Pool.new("spec/resque-pool.yml") }
+  let(:pool) { Resque::Pool.instance }
 
   context "when RAILS_ENV is set" do
-    before { RAILS_ENV = "test" }
+    before do
+      RAILS_ENV = "test"
+      pool.init_config("spec/resque-pool.yml")
+    end
+
+    subject { pool }
 
     it "should load the default YAML" do
       subject.config["foo"].should == 1
@@ -138,7 +163,13 @@ describe Resque::Pool, "when loading the pool configuration from a file" do
   end
 
   context "when ENV['RACK_ENV'] is set" do
-    before { ENV['RACK_ENV'] = 'development' }
+    before do
+      ENV['RACK_ENV'] = 'development'
+      pool.init_config("spec/resque-pool.yml")
+    end
+
+    subject { pool }
+
     it "should load the config for that environment" do
       subject.config["foo"].should == 1
       subject.config["foo,bar"].should == 4
@@ -148,6 +179,9 @@ describe Resque::Pool, "when loading the pool configuration from a file" do
   end
 
   context "when there is no environment" do
+    before { pool.init_config("spec/resque-pool.yml") }
+    subject { pool }
+
     it "should load the default values only" do
       subject.config["foo"].should == 1
       subject.config["bar"].should be_nil
@@ -157,17 +191,22 @@ describe Resque::Pool, "when loading the pool configuration from a file" do
   end
 
   context "when a custom file is specified" do
-    before { ENV["RESQUE_POOL_CONFIG"] = 'spec/resque-pool-custom.yml.erb' }
-    subject { Resque::Pool.new(Resque::Pool.choose_config_file) }
+    let(:pool) { Resque::Pool.instance }
+
+    before do
+      ENV["RESQUE_POOL_CONFIG"] = 'spec/resque-pool-custom.yml.erb'
+      pool.init_config Resque::Pool.choose_config_file
+    end
+
     it "should find the right file, and parse the ERB" do
-      subject.config["foo"].should == 2
+      pool.config["foo"].should == 2
     end
   end
-
 end
 
 describe Resque::Pool, "given after_prefork hook" do
-  subject { Resque::Pool.new(nil) }
+  let(:pool) { Resque::Pool.instance }
+  subject { pool }
 
   context "with a single hook" do
     before { Resque::Pool.after_prefork { @called = true } }

@@ -10,6 +10,8 @@ require 'yaml'
 
 module Resque
   class Pool
+    include Singleton
+
     SIG_QUEUE_MAX_SIZE = 5
     DEFAULT_WORKER_INTERVAL = 5
     QUEUE_SIGS = [ :QUIT, :INT, :TERM, :USR1, :USR2, :CONT, :HUP, :WINCH, ]
@@ -20,8 +22,7 @@ module Resque
     attr_reader :config
     attr_reader :workers
 
-    def initialize(config)
-      init_config(config)
+    def initialize
       @workers = Hash.new { |workers, queues| workers[queues] = {} }
       procline "(initialized)"
     end
@@ -93,7 +94,9 @@ module Resque
       if GC.respond_to?(:copy_on_write_friendly=)
         GC.copy_on_write_friendly = true
       end
-      Resque::Pool.new(choose_config_file).start.join
+
+      instance.init_config(choose_config_file)
+      instance.start.join
     end
 
     # }}}
@@ -121,6 +124,7 @@ module Resque
       else
         @config ||= {}
       end
+
       environment and @config[environment] and config.merge!(@config[environment])
       config.delete_if {|key, value| value.is_a? Hash }
     end
