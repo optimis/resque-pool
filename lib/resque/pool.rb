@@ -4,6 +4,7 @@ require 'resque/worker'
 require 'resque/pool/version'
 require 'resque/pool/logging'
 require 'resque/pool/pooled_worker'
+require 'resque/pool/drb_server'
 require 'erb'
 require 'fcntl'
 require 'yaml'
@@ -97,6 +98,8 @@ module Resque
 
       instance.init_config(choose_config_file)
       instance.start.join
+
+      DrbServer.instance.start
     end
 
     # }}}
