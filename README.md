@@ -1,26 +1,26 @@
 Resque Pool
 ===========
 
-[![Build Status](https://secure.travis-ci.org/nevans/resque-pool.png)](http://travis-ci.org/nevans/resque-pool)
+[![Build Status](https://travis-ci.org/nevans/resque-pool.png)](https://travis-ci.org/nevans/resque-pool)
 [![Dependency Status](https://gemnasium.com/nevans/resque-pool.png)](https://gemnasium.com/nevans/resque-pool)
 
-Resque pool is a simple library for managing a pool of
-[resque](http://github.com/defunkt/resque) workers.  Given a a config file, it
-manages your workers for you, starting up the appropriate number of workers for
-each worker type.
+Resque pool is a daemon for managing a pool of
+[resque](https://github.com/defunkt/resque) workers.  With a simple config file,
+it manages your workers for you, starting up the appropriate number of workers
+for each worker type.
 
 Benefits
 ---------
 
 * Less config - With a simple YAML file, you can start up a pool daemon, and it
-  will monitor your workers for you.  An example init.d script, monit config,
-  and chef cookbook are provided.
-* Less memory - If you are using Ruby Enterprise Edition, or any ruby with
-  copy-on-write safe garbage collection, this should save you a *lot* of memory
-  when you are managing many workers.
+  will monitor your workers for you.
+* Less memory - If you are using ruby 2.0+ (with copy-on-write safe garbage
+  collection), this should save you a *lot* of memory when you are managing many
+  workers.
 * Faster startup - when you start many workers at once, they would normally
-  compete for CPU as they load their environments.  Resque-pool can load the
-  environment once and fork all of the workers almost instantly.
+  compete for CPU as they load their environments.  Resque-pool can load your
+  application once, then rapidly fork the workers after setup.  If a worker
+  crashes or is killed, a new worker will start up and take its place right away.
 
 Upgrading?
 -----------
@@ -40,12 +40,14 @@ environment specific overrides (`RACK_ENV`, `RAILS_ENV`, and `RESQUE_ENV`
 environment variables can be used to determine environment).  For example in
 `config/resque-pool.yml`:
 
-    foo: 1
-    bar: 2
-    "foo,bar,baz": 1
+```Yaml
+foo: 1
+bar: 2
+"foo,bar,baz": 1
 
-    production:
-      "foo,bar,baz": 4
+production:
+  "foo,bar,baz": 4
+```
 
 ### Rake task config
 
@@ -55,20 +57,35 @@ application environment, configure Resque as necessary, and configure
 manager and reconnect in the workers.  For example, with rails you should put
 the following into `lib/tasks/resque.rake`:
 
-    require 'resque/pool/tasks'
-    # this task will get called before resque:pool:setup
-    # and preload the rails environment in the pool manager
-    task "resque:setup" => :environment do
-      # generic worker setup, e.g. Hoptoad for failed jobs
-    end
-    task "resque:pool:setup" do
-      # close any sockets or files in pool manager
-      ActiveRecord::Base.connection.disconnect!
-      # and re-open them in the resque worker parent
-      Resque::Pool.after_prefork do |job|
-        ActiveRecord::Base.establish_connection
-      end
-    end
+```Ruby
+require 'resque/pool/tasks'
+
+# this task will get called before resque:pool:setup
+# and preload the rails environment in the pool manager
+task "resque:setup" => :environment do
+  # generic worker setup, e.g. Hoptoad for failed jobs
+end
+
+task "resque:pool:setup" do
+  # close any sockets or files in pool manager
+  ActiveRecord::Base.connection.disconnect!
+  # and re-open them in the resque worker parent
+  Resque::Pool.after_prefork do |job|
+    ActiveRecord::Base.establish_connection
+  end
+end
+```
+
+
+For normal work with fresh resque and resque-scheduler gems add next lines in lib/rake/resque.rake
+
+```ruby
+task "resque:pool:setup" do
+  Resque::Pool.after_prefork do |job|
+    Resque.redis.client.reconnect
+  end
+end
+```
 
 ### Start the pool manager
 
@@ -113,7 +130,7 @@ SIGNALS
 
 The pool manager responds to the following signals:
 
-* `HUP`   - reload the config file, reload logfiles, restart all workers.
+* `HUP`   - reset config loader (reload the config file), reload logfiles, restart all workers.
 * `QUIT`  - gracefully shut down workers (via `QUIT`) and shutdown the manager
   after all workers are done.
 * `INT`   - gracefully shut down workers (via `QUIT`) and immediately shutdown manager
@@ -132,13 +149,64 @@ defined by Resque 1.22 and above. See http://hone.heroku.com/resque/2012/08/21/r
 for details, overriding any command-line configuration for `TERM`. Setting `TERM_CHILD` tells
 us you know what you're doing.
 
+Custom Configuration Loader
+---------------------------
+
+If the static YAML file configuration approach does not meet your needs, you can
+specify a custom configuration loader.
+
+Set the `config_loader` class variable on Resque::Pool to an object that
+responds to `#call` (which can simply be a lambda/Proc). The class attribute
+needs to be set before starting the pool. This is usually accomplished
+in the `resque:pool:setup` rake task, as described above.
+
+For example, if you wanted to vary the number of worker processes based on a
+value stored in Redis, you could do something like:
+
+```ruby
+task "resque:pool:setup" do
+  Resque::Pool.config_loader = lambda do |env|
+    worker_count = Redis.current.get("pool_workers_#{env}").to_i
+    {"queueA,queueB" => worker_count }
+  end
+end
+```
+
+The configuration loader's `#call` method will be invoked about once a second.
+This allows the configuration to constantly change, allowing you to scale the
+number of workers up or down based on different conditions.
+If the response is generally static, the loader may want to cache the value it
+returns. It can optionally implement a `#reset!` method, which will be invoked
+when the HUP signal is received, allowing the loader to flush its cache, or
+perform any other re-initialization.
+
+Zero-downtime code deploys
+--------------------------
+
+In a production environment you will likely want to manage the daemon using a
+process supervisor like `runit` or `god` or an init system like `systemd` or
+`upstart`.  Example configurations for some of these are included in the
+`examples` directory.  With these systems, `reload` typically sends a `HUP`
+signal, which will reload the configuration but not application code.  The
+simplest way to make workers pick up new code after a deploy is to stop and
+start the daemon.  This will result in a period where new jobs are not being
+processed.
+
+To avoid this downtime, leave the old pool running and start a new pool with
+`resque-pool --hot-swap`.
+
+The `--hot-swap` flag will turn off pidfiles (so multiple pools can run at
+once), enable a lock file (so your init system knows when the pool is running),
+and shut down other pools _after_ the workers have started for this pool.
+These behaviors can also be configured separately (see `resque-pool --help`).
+The `upstart` configs in the `examples` directory demonstrate how to supervise a
+daemonized pool with hot swap.
+
+Please be aware that this approach uses more memory than a simple restart, since
+two copies of the application code are loaded at once. _TODO: [#139](https://github.com/nevans/resque-pool/issues/139)_
+
 Other Features
 --------------
-
-An example chef cookbook is provided (and should Just Work at Engine Yard as
-is; just provide a `/data/#{app_name}/shared/config/resque-pool.yml` on your
-utility instances).  Even if you don't use chef you can use the example init.d
-and monitrc erb templates in `examples/chef_cookbook/templates/default`.
 
 You can also start a pool manager via `rake resque:pool` or from a plain old
 ruby script by calling `Resque::Pool.run`.
@@ -149,6 +217,10 @@ their current job) if the manager process disappears before them.
 You can specify an alternate config file by setting the `RESQUE_POOL_CONFIG` or
 with the `--config` command line option.
 
+See the `examples` directory for example `chef` cookbook and
+`god` config.  In the `chef` cookbook, you can also find example `init.d` and
+`muninrc` templates (all very out of date, pull requests welcome).
+
 TODO
 -----
 
@@ -157,8 +229,4 @@ See [the TODO list](https://github.com/nevans/resque-pool/issues) at github issu
 Contributors
 -------------
 
-* John Schult (config file can be split by environment)
-* Stephen Celis (increased gemspec sanity)
-* Vincent Agnello, Robert Kamunyori, Paul Kauders; for pairing with me at
-  B'more on Rails Open Source Hack Nights. :)
-
+See [list of contributors on github](https://github.com/nevans/resque-pool/graphs/contributors) or [in the changelog](https://github.com/nevans/resque-pool/blob/master/Changelog.md)

@@ -4,6 +4,7 @@ require 'resque/worker'
 require 'resque/pool/version'
 require 'resque/pool/logging'
 require 'resque/pool/pooled_worker'
+require 'resque/pool/file_or_hash_loader'
 require 'erb'
 require 'fcntl'
 require 'yaml'
@@ -18,48 +19,63 @@ module Resque
     include Logging
     extend  Logging
     attr_reader :config
+    attr_reader :config_loader
     attr_reader :workers
 
-    def initialize(config)
-      init_config(config)
+    def initialize(config_loader=nil)
+      init_config(config_loader)
       @workers = Hash.new { |workers, queues| workers[queues] = {} }
       procline "(initialized)"
     end
 
-    # Config: after_prefork {{{
+    # Config: hooks {{{
 
-    # The `after_prefork` hooks will be run in workers if you are using the
-    # preforking master worker to save memory. Use these hooks to reload
-    # database connections and so forth to ensure that they're not shared
-    # among workers.
-    #
-    # Call with a block to set a hook.
-    # Call with no arguments to return all registered hooks.
-    #
-    def self.after_prefork(&block)
-      @after_prefork ||= []
-      block ? (@after_prefork << block) : @after_prefork
+    def self.hook(name) # :nodoc:
+      class_eval <<-CODE
+        def self.#{name}(&block)
+          @#{name} ||= []
+          block ? (@#{name} << block) : @#{name}
+        end
+
+        def self.#{name}=(block)
+          @#{name} = [block]
+        end
+
+        def call_#{name}!(*args)
+          self.class.#{name}.each do |hook|
+            hook.call(*args)
+          end
+        end
+      CODE
     end
 
-    # Sets the after_prefork proc, clearing all pre-existing hooks.
-    # Warning: you probably don't want to clear out the other hooks.
-    # You can use `Resque::Pool.after_prefork << my_hook` instead.
+    ##
+    # :call-seq:
+    #   after_prefork do |worker| ... end   => add a hook
+    #   after_prefork << hook               => add a hook
     #
-    def self.after_prefork=(after_prefork)
-      @after_prefork = [after_prefork]
-    end
+    # +after_prefork+ will run in workers before any jobs.  Use these hooks e.g.
+    # to reload database connections to ensure that they're not shared among
+    # workers.
+    #
+    # :yields: worker
+    hook :after_prefork
 
-    def call_after_prefork!
-      self.class.after_prefork.each do |hook|
-        hook.call
-      end
-    end
+    ##
+    # :call-seq:
+    #   after_prefork do |worker, pid, workers| ... end  => add a hook
+    #   after_prefork << hook                            => add a hook
+    #
+    # The `after_spawn` hooks will run in the master after spawning a new
+    # worker.
+    #
+    # :yields: worker, pid, workers
+    hook :after_spawn
 
     # }}}
-    # Config: class methods to start up the pool using the default config {{{
+    # Config: class methods to start up the pool using the config loader {{{
 
-    @config_files = ["resque-pool.yml", "config/resque-pool.yml"]
-    class << self; attr_accessor :config_files, :app_name; end
+    class << self; attr_accessor :config_loader, :app_name, :spawn_delay; end
 
     def self.app_name
       @app_name ||= File.basename(Dir.pwd)
@@ -72,6 +88,11 @@ module Resque
       @handle_winch = bool
     end
 
+    def self.kill_other_pools!
+      require 'resque/pool/killer'
+      Resque::Pool::Killer.run
+    end
+
     def self.single_process_group=(bool)
       ENV["RESQUE_SINGLE_PGRP"] = !!bool ? "YES" : "NO"
     end
@@ -81,48 +102,38 @@ module Resque
       )
     end
 
-    def self.choose_config_file
-      if ENV["RESQUE_POOL_CONFIG"]
-        ENV["RESQUE_POOL_CONFIG"]
-      else
-        @config_files.detect { |f| File.exist?(f) }
-      end
-    end
-
     def self.run
       if GC.respond_to?(:copy_on_write_friendly=)
         GC.copy_on_write_friendly = true
       end
-      Resque::Pool.new(choose_config_file).start.join
+      create_configured.start.join
+    end
+
+    def self.create_configured
+      Resque::Pool.new(config_loader)
     end
 
     # }}}
-    # Config: load config and config file {{{
+    # Config: store loader and load config {{{
 
-    def config_file
-      @config_file || (!@config && ::Resque::Pool.choose_config_file)
-    end
-
-    def init_config(config)
-      case config
-      when String, nil
-        @config_file = config
+    def init_config(loader)
+      case loader
+      when String, Hash, nil
+        @config_loader = FileOrHashLoader.new(loader)
       else
-        @config = config.dup
+        @config_loader = loader
       end
       load_config
     end
 
     def load_config
-      if config_file
-        @config = YAML.load(ERB.new(IO.read(config_file)).result)
+      @config = config_loader.call(environment)
+      add_wildcard_configuration
+    end
 
-        add_wildcard_configuration
-      else
-        @config ||= {}
-      end
-      environment and @config[environment] and config.merge!(@config[environment])
-      config.delete_if {|key, value| value.is_a? Hash }
+    def reset_config
+      config_loader.reset! if config_loader.respond_to?(:reset!)
+      load_config
     end
 
     def environment
@@ -191,8 +202,8 @@ module Resque
         log "#{signal}: sending to all workers"
         signal_all_workers(signal)
       when :HUP
-        log "HUP: reload config file and reload logfiles"
-        load_config
+        log "HUP: reset configuration and reload logfiles"
+        reset_config
         Logging.reopen_logs!
         log "HUP: gracefully shutdown old children (which have old logfiles open)"
         if term_child
@@ -217,23 +228,20 @@ module Resque
       when :INT
         graceful_worker_shutdown!(signal)
       when :TERM
-        if term_child
+        case self.class.term_behavior
+        when "graceful_worker_shutdown_and_wait"
+          graceful_worker_shutdown_and_wait!(signal)
+        when "graceful_worker_shutdown"
           graceful_worker_shutdown!(signal)
         else
-          case self.class.term_behavior
-          when "graceful_worker_shutdown_and_wait"
-            graceful_worker_shutdown_and_wait!(signal)
-          when "graceful_worker_shutdown"
-            graceful_worker_shutdown!(signal)
-          else
-            shutdown_everything_now!(signal)
-          end
+          shutdown_everything_now!(signal)
         end
       end
     end
 
     class << self
       attr_accessor :term_behavior
+      attr_accessor :kill_other_pools
     end
 
     def graceful_worker_shutdown_and_wait!(signal)
@@ -278,6 +286,7 @@ module Resque
       procline("(started)")
       log "started manager"
       report_worker_pool_pids
+      self.class.kill_other_pools! if self.class.kill_other_pools
       self
     end
 
@@ -295,6 +304,7 @@ module Resque
         break if handle_sig_queue! == :break
         if sig_queue.empty?
           master_sleep
+          load_config
           maintain_worker_count
         end
         procline("managing #{all_pids.inspect}")
@@ -350,6 +360,7 @@ module Resque
     end
 
     def signal_all_workers(signal)
+      log "Sending #{signal} to all workers"
       all_pids.each do |pid|
         Process.kill signal, pid
       end
@@ -377,6 +388,7 @@ module Resque
     def spawn_missing_workers_for(queues)
       worker_delta_for(queues).times do |nr|
         spawn_worker!(queues)
+        sleep Resque::Pool.spawn_delay if Resque::Pool.spawn_delay
       end
     end
 
@@ -399,20 +411,27 @@ module Resque
       worker = create_worker(queues)
       pid = fork do
         Process.setpgrp unless Resque::Pool.single_process_group
+        worker.worker_parent_pid = Process.pid
         log_worker "Starting worker #{worker}"
-        call_after_prefork!
+        call_after_prefork!(worker)
         reset_sig_handlers!
         #self_pipe.each {|io| io.close }
         worker.work(ENV['INTERVAL'] || DEFAULT_WORKER_INTERVAL) # interval, will block
       end
       workers[queues][pid] = worker
+      call_after_spawn!(worker, pid, workers)
     end
 
     def create_worker(queues)
       queues = queues.to_s.split(',')
       worker = ::Resque::Worker.new(*queues)
+      worker.pool_master_pid = Process.pid
       worker.term_timeout = ENV['RESQUE_TERM_TIMEOUT'] || 4.0
       worker.term_child = ENV['TERM_CHILD']
+      if worker.respond_to?(:run_at_exit_hooks=)
+        # resque doesn't support this until 1.24, but we support 1.22
+        worker.run_at_exit_hooks = ENV['RUN_AT_EXIT_HOOKS'] || false
+      end
       if ENV['LOGGING'] || ENV['VERBOSE']
         worker.verbose = ENV['LOGGING'] || ENV['VERBOSE']
       end

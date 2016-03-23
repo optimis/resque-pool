@@ -1,14 +1,18 @@
-require 'trollop'
+require 'optparse'
 require 'resque/pool'
+require 'resque/pool/logging'
 require 'fileutils'
 
 module Resque
   class Pool
     module CLI
+      include Logging
+      extend  Logging
       extend self
 
       def run
         opts = parse_options
+        obtain_shared_lock opts[:lock_file]
         daemonize if opts[:daemon]
         manage_pidfile opts[:pidfile]
         redirect opts
@@ -17,37 +21,58 @@ module Resque
         start_pool
       end
 
-      def parse_options
-        opts = Trollop::options do
-          version "resque-pool #{VERSION} (c) nicholas a. evans"
-          banner <<-EOS
-resque-pool is the best way to manage a group (pool) of resque workers
+      def parse_options(argv=nil)
+        opts = {}
+        parser = OptionParser.new do |opt|
+          opt.banner = <<-EOS.gsub(/^            /, '')
+            resque-pool is the best way to manage a group (pool) of resque workers
 
-When daemonized, stdout and stderr default to resque-pool.stdxxx.log files in
-the log directory and pidfile defaults to resque-pool.pid in the current dir.
+            When daemonized, stdout and stderr default to resque-pool.stdxxx.log files in
+            the log directory and pidfile defaults to resque-pool.pid in the current dir.
 
-Usage:
-   resque-pool [options]
-where [options] are:
+            Usage:
+               resque-pool [options]
+
+            where [options] are:
           EOS
-          opt :config, "Alternate path to config file", :type => String, :short => "-c"
-          opt :appname, "Alternate appname",         :type => String,    :short => "-a"
-          opt :daemon, "Run as a background daemon", :default => false,  :short => "-d"
-          opt :stdout, "Redirect stdout to logfile", :type => String,    :short => '-o'
-          opt :stderr, "Redirect stderr to logfile", :type => String,    :short => '-e'
-          opt :nosync, "Don't sync logfiles on every write"
-          opt :pidfile, "PID file location",         :type => String,    :short => "-p"
-          opt :environment, "Set RAILS_ENV/RACK_ENV/RESQUE_ENV", :type => String, :short => "-E"
-          opt :term_graceful_wait, "On TERM signal, wait for workers to shut down gracefully"
-          opt :term_graceful,      "On TERM signal, shut down workers gracefully"
-          opt :term_immediate,     "On TERM signal, shut down workers immediately (default)"
-          opt :single_process_group, "Workers remain in the same process group as the master", :default => false
+          opt.on('-c', '--config PATH', "Alternate path to config file") { |c| opts[:config] = c }
+          opt.on('-a', '--appname NAME', "Alternate appname") { |c| opts[:appname] = c }
+          opt.on("-d", '--daemon', "Run as a background daemon") {
+            opts[:daemon] = true
+            opts[:stdout]  ||= "log/resque-pool.stdout.log"
+            opts[:stderr]  ||= "log/resque-pool.stderr.log"
+            opts[:pidfile] ||= "tmp/pids/resque-pool.pid" unless opts[:no_pidfile]
+          }
+          opt.on("-k", '--kill-others', "Shutdown any other Resque Pools on startup") { opts[:killothers] = true }
+          opt.on('-o', '--stdout FILE', "Redirect stdout to logfile") { |c| opts[:stdout] = c }
+          opt.on('-e', '--stderr FILE', "Redirect stderr to logfile") { |c| opts[:stderr] = c }
+          opt.on('--nosync', "Don't sync logfiles on every write") { opts[:nosync] = true }
+          opt.on("-p", '--pidfile FILE', "PID file location") { |c|
+            opts[:pidfile] = c
+            opts[:no_pidfile] = false
+          }
+          opt.on('--no-pidfile', "Force no pidfile, even if daemonized") {
+            opts[:pidfile] = nil
+            opts[:no_pidfile] = true
+          }
+          opt.on('-l', '--lock FILE' "Open a shared lock on a file") { |c| opts[:lock_file] = c }
+          opt.on("-H", "--hot-swap", "Set appropriate defaults to hot-swap a new pool for a running pool") {|c|
+            opts[:pidfile] = nil
+            opts[:no_pidfile] = true
+            opts[:lock_file] ||= "tmp/resque-pool.lock"
+            opts[:killothers] = true
+          }
+          opt.on("-E", '--environment ENVIRONMENT', "Set RAILS_ENV/RACK_ENV/RESQUE_ENV") { |c| opts[:environment] = c }
+          opt.on("-s", '--spawn-delay MS', Integer, "Delay in milliseconds between spawning missing workers") { |c| opts[:spawn_delay] = c }
+          opt.on('--term-graceful-wait', "On TERM signal, wait for workers to shut down gracefully") { opts[:term_graceful_wait] = true }
+          opt.on('--term-graceful',      "On TERM signal, shut down workers gracefully") { opts[:term_graceful] = true }
+          opt.on('--term-immediate',     "On TERM signal, shut down workers immediately (default)") { opts[:term_immediate] = true }
+          opt.on('--single-process-group', "Workers remain in the same process group as the master") { opts[:single_process_group] = true }
+          opt.on("-h", "--help", "Show this.") { puts opt; exit }
+          opt.on("-v", "--version", "Show Version"){ puts "resque-pool #{VERSION} (c) nicholas a. evans"; exit}
         end
-        if opts[:daemon]
-          opts[:stdout]  ||= "log/resque-pool.stdout.log"
-          opts[:stderr]  ||= "log/resque-pool.stderr.log"
-          opts[:pidfile] ||= "tmp/pids/resque-pool.pid"
-        end
+        parser.parse!(argv || parser.default_argv)
+
         opts
       end
 
@@ -57,6 +82,18 @@ where [options] are:
         Process.setsid
         raise 'Second fork failed' if (pid = fork) == -1
         exit unless pid.nil?
+      end
+
+      # Obtain a lock on a file that will be held for the lifetime of
+      # the process.  This aids in concurrent daemonized deployment with
+      # process managers like upstart since multiple pools can share a
+      # lock, but not a pidfile.
+      def obtain_shared_lock(lock_path)
+        return unless lock_path
+        @lock_file = File.open(lock_path, 'w')
+        unless @lock_file.flock(File::LOCK_SH)
+          fail "unable to obtain shared lock on #{@lock_file}"
+        end
       end
 
       def manage_pidfile(pidfile)
@@ -113,7 +150,17 @@ where [options] are:
           Resque::Pool.term_behavior = "graceful_worker_shutdown_and_wait"
         elsif opts[:term_graceful]
           Resque::Pool.term_behavior = "graceful_worker_shutdown"
+        elsif ENV["TERM_CHILD"]
+          log "TERM_CHILD enabled, so will user 'term-graceful-and-wait' behaviour"
+          Resque::Pool.term_behavior = "graceful_worker_shutdown_and_wait"
         end
+        if ENV.include?("DYNO") && !ENV["TERM_CHILD"]
+          log "WARNING: Are you running on Heroku? You should probably set TERM_CHILD=1"
+        end
+        if opts[:spawn_delay]
+          Resque::Pool.spawn_delay = opts[:spawn_delay] * 0.001
+        end
+        Resque::Pool.kill_other_pools = !!opts[:killothers]
       end
 
       def setup_environment(opts)
